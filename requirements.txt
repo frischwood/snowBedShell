@@ -1,0 +1,10 @@
+streamlit>=1.30
+streamlit-folium>=0.18
+folium>=0.15
+numpy
+scipy
+rasterio
+pyproj
+requests
+shapely
+matplotlib
