@@ -256,6 +256,39 @@ def extend_domain(x, y, Z, buffer_width=200.0, ref_elevation="mean_edge",
 
 
 # ---------------------------------------------------------------------------
+# Step 3b: Optional coordinate transforms
+# ---------------------------------------------------------------------------
+
+def shift_z_origin(Z_ext, z_top, z_ref, log=print):
+    """Shift all elevations so Z_ext.min() == 0.
+
+    Returns (Z_ext, z_top, z_ref, z_shift) where z_shift is the value subtracted.
+    """
+    z_min = float(Z_ext.min())
+    Z_ext = Z_ext - z_min
+    z_top = z_top - z_min
+    z_ref = z_ref - z_min
+    log(f"  Z-shift: subtracted {z_min:.1f}m (new range [{Z_ext.min():.1f}, {Z_ext.max():.1f}])")
+    return Z_ext, z_top, z_ref, z_min
+
+
+def rotate_axes_north(x_ext, y_ext, Z_ext, log=print):
+    """Rotate coordinate system 90 deg CW so x-axis points North.
+
+    Mapping: new_x = old_y, new_y = -old_x (right-handed: x=North, y=West, z=Up).
+    Z array is rotated with np.rot90(Z, k=1).
+
+    Returns (x_new, y_new, Z_new).
+    """
+    x_new = y_ext.copy()
+    y_new = -x_ext[::-1].copy()
+    Z_new = np.rot90(Z_ext, k=1)
+    log(f"  Rotated: x-axis now points North (x=[{x_new[0]:.1f}, {x_new[-1]:.1f}], "
+        f"y=[{y_new[0]:.1f}, {y_new[-1]:.1f}])")
+    return x_new, y_new, Z_new
+
+
+# ---------------------------------------------------------------------------
 # Step 4: Generate cfMesh surface files
 # ---------------------------------------------------------------------------
 
@@ -480,7 +513,7 @@ def _write_stl(path, vertices, triangles):
 # Step 5: Template OpenFOAM dicts
 # ---------------------------------------------------------------------------
 
-def write_openfoam_dicts(output_dir, mesh_cell_size=8, log=print):
+def write_openfoam_dicts(output_dir, mesh_cell_size=8, x_axis_north=False, log=print):
     """Write meshDict and createPatchDict templates."""
     output_dir = Path(output_dir)
     system_dir = output_dir / "system"
@@ -541,7 +574,17 @@ renameBoundary
     log(f"  Written: meshDict")
 
     cpd_path = system_dir / "createPatchDict"
-    cpd_path.write_text("""\
+    if x_axis_north:
+        coord_comment = (
+            "// Coordinate system: X = North, Y = -East (West), Z = Up\n"
+            "// inlet (xMin) = South, outlet (xMax) = North\n"
+            "// front (yMin) = East, back (yMax) = West\n\n"
+        )
+    else:
+        coord_comment = (
+            "// Coordinate system: X = East, Y = North, Z = Up\n\n"
+        )
+    cpd_path.write_text(coord_comment + """\
 /*--------------------------------*- C++ -*----------------------------------*\\
 | =========                 |                                                 |
 | \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
@@ -636,3 +679,61 @@ def wgs84_to_lv95(bbox_wgs84):
     e_min, n_min = t.transform(bbox_wgs84[0], bbox_wgs84[1])
     e_max, n_max = t.transform(bbox_wgs84[2], bbox_wgs84[3])
     return (e_min, n_min, e_max, n_max)
+
+
+def read_shp_bbox(shp_file, shx_file=None, dbf_file=None, prj_file=None):
+    """Read bounding box from a .shp file, return as LV95 tuple.
+
+    Parameters
+    ----------
+    shp_file : file-like
+        The .shp file.
+    shx_file, dbf_file : file-like, optional
+        Companion files (pyshp may need them).
+    prj_file : file-like or str, optional
+        The .prj file for CRS detection. If absent, LV95 (EPSG:2056) is assumed.
+
+    Returns
+    -------
+    bbox_lv95 : tuple
+        (e_min, n_min, e_max, n_max) in EPSG:2056.
+    source_crs : str
+        Detected or assumed CRS identifier.
+    """
+    import shapefile
+
+    kwargs = {"shp": shp_file}
+    if shx_file is not None:
+        kwargs["shx"] = shx_file
+    if dbf_file is not None:
+        kwargs["dbf"] = dbf_file
+
+    reader = shapefile.Reader(**kwargs)
+    x_min, y_min, x_max, y_max = reader.bbox
+
+    # Detect CRS from .prj
+    source_crs = "EPSG:2056"
+    if prj_file is not None:
+        prj_text = prj_file if isinstance(prj_file, str) else prj_file.read()
+        if isinstance(prj_text, bytes):
+            prj_text = prj_text.decode("utf-8")
+        from pyproj import CRS
+        try:
+            detected = CRS.from_wkt(prj_text)
+            epsg = detected.to_epsg()
+            source_crs = f"EPSG:{epsg}" if epsg else detected.to_string()
+        except Exception:
+            pass
+
+    # Transform to LV95 if needed
+    if source_crs != "EPSG:2056":
+        t = Transformer.from_crs(source_crs, "EPSG:2056", always_xy=True)
+        e_min, n_min = t.transform(x_min, y_min)
+        e_max, n_max = t.transform(x_max, y_max)
+        if e_min > e_max:
+            e_min, e_max = e_max, e_min
+        if n_min > n_max:
+            n_min, n_max = n_max, n_min
+        return (e_min, n_min, e_max, n_max), source_crs
+
+    return (x_min, y_min, x_max, y_max), source_crs

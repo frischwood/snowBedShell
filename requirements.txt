@@ -8,3 +8,4 @@ pyproj
 requests
 shapely
 matplotlib
+pyshp>=2.3

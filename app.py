@@ -25,10 +25,13 @@ from pipeline import (
     download_dem_tiles,
     process_dem,
     extend_domain,
+    shift_z_origin,
+    rotate_axes_north,
     triangulate_and_write,
     write_openfoam_dicts,
     wgs84_to_lv95,
     lv95_to_wgs84,
+    read_shp_bbox,
 )
 
 # ---------------------------------------------------------------------------
@@ -156,6 +159,17 @@ with st.sidebar:
     )
     include_stl = st.checkbox("Include STL in output", value=True,
                               help="ASCII STL for ParaView preview (can be large)")
+
+    st.divider()
+    st.header("Coordinate transforms")
+    shift_z_to_zero = st.checkbox(
+        "Shift elevation to zero", value=True,
+        help="Subtract minimum elevation so terrain base starts near z=0",
+    )
+    x_axis_north = st.checkbox(
+        "X-axis positive towards North", value=True,
+        help="Rotate 90° CW so X points North (right-handed: Y=West, Z=Up)",
+    )
 
 # ---------------------------------------------------------------------------
 # Map selection
@@ -285,6 +299,68 @@ with st.expander("Or enter LV95 coordinates manually"):
         except ValueError:
             st.error("Invalid number format")
 
+# SHP upload
+with st.expander("Or upload a shapefile (.shp)"):
+    uploaded_files = st.file_uploader(
+        "Upload .shp (required) and companion files (.shx, .dbf, .prj), or a .zip",
+        type=["shp", "shx", "dbf", "prj", "zip"],
+        accept_multiple_files=True,
+        key="shp_upload",
+    )
+    if uploaded_files:
+        shp_file = shx_file = dbf_file = prj_file = None
+
+        for uf in uploaded_files:
+            name_lower = uf.name.lower()
+            if name_lower.endswith(".zip"):
+                with zipfile.ZipFile(uf) as zf:
+                    for zname in zf.namelist():
+                        zname_lower = zname.lower()
+                        if zname_lower.endswith(".shp"):
+                            shp_file = io.BytesIO(zf.read(zname))
+                        elif zname_lower.endswith(".shx"):
+                            shx_file = io.BytesIO(zf.read(zname))
+                        elif zname_lower.endswith(".dbf"):
+                            dbf_file = io.BytesIO(zf.read(zname))
+                        elif zname_lower.endswith(".prj"):
+                            prj_file = io.BytesIO(zf.read(zname))
+            elif name_lower.endswith(".shp"):
+                shp_file = uf
+            elif name_lower.endswith(".shx"):
+                shx_file = uf
+            elif name_lower.endswith(".dbf"):
+                dbf_file = uf
+            elif name_lower.endswith(".prj"):
+                prj_file = uf
+
+        if shp_file is None:
+            st.error("No .shp file found.")
+        else:
+            try:
+                bbox_from_shp, detected_crs = read_shp_bbox(
+                    shp_file, shx_file=shx_file, dbf_file=dbf_file, prj_file=prj_file,
+                )
+                st.info(f"Detected CRS: {detected_crs}")
+                st.caption(
+                    f"Bounding box (LV95): E [{bbox_from_shp[0]:.0f}, {bbox_from_shp[2]:.0f}], "
+                    f"N [{bbox_from_shp[1]:.0f}, {bbox_from_shp[3]:.0f}]"
+                )
+
+                ok, msg = validate_roi(bbox_from_shp)
+                if ok:
+                    if st.button("Use this bounding box", key="use_shp_bbox"):
+                        st.session_state.bbox_lv95 = bbox_from_shp
+                        st.session_state.bbox_wgs84 = lv95_to_wgs84(bbox_from_shp)
+                        st.session_state.roi_error = None
+                        st.session_state.result_zip = None
+                        st.session_state.result_plot = None
+                        st.session_state.result_meta = None
+                        st.rerun()
+                else:
+                    st.error(msg)
+            except Exception as e:
+                st.error(f"Failed to read shapefile: {e}")
+
 # ---------------------------------------------------------------------------
 # Run pipeline
 # ---------------------------------------------------------------------------
@@ -330,6 +406,22 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
                 log=lambda msg: status.write(msg),
             )
 
+            # Step 3b: Coordinate transforms
+            z_shift = 0.0
+            if shift_z_to_zero:
+                status.write("Shifting elevation origin to zero...")
+                Z_ext, z_top, z_ref, z_shift = shift_z_origin(
+                    Z_ext, z_top, z_ref,
+                    log=lambda msg: status.write(msg),
+                )
+
+            if x_axis_north:
+                status.write("Rotating coordinate system (X -> North)...")
+                x_ext, y_ext, Z_ext = rotate_axes_north(
+                    x_ext, y_ext, Z_ext,
+                    log=lambda msg: status.write(msg),
+                )
+
             # Step 4: Generate surfaces
             status.write("Generating cfMesh surface files (this may take a moment)...")
             fms_path, stl_path = triangulate_and_write(
@@ -341,7 +433,7 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
             # Step 5: OpenFOAM dicts
             status.write("Writing OpenFOAM dictionaries...")
             write_openfoam_dicts(
-                output_dir, mesh_cell_size,
+                output_dir, mesh_cell_size, x_axis_north=x_axis_north,
                 log=lambda msg: status.write(msg),
             )
 
@@ -361,6 +453,9 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
                 "y_range": [float(y_ext[0]), float(y_ext[-1])],
                 "z_range": [float(Z_ext.min()), float(Z_ext.max())],
                 "z_top": z_top,
+                "z_shift_applied": z_shift,
+                "x_axis_north": x_axis_north,
+                "coordinate_system": "X=North, Y=West, Z=Up" if x_axis_north else "X=East, Y=North, Z=Up",
             }
             meta_path = output_dir / "metadata.json"
             meta_path.write_text(json.dumps(metadata, indent=2))
