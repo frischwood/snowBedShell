@@ -24,9 +24,11 @@ from shapely.geometry import Polygon, box as shapely_box
 from pipeline import (
     download_dem_tiles,
     process_dem,
+    compute_rotated_download_bbox,
+    resample_rotated_grid,
     extend_domain,
+    write_padded_roi_shp,
     shift_z_origin,
-    rotate_axes_north,
     triangulate_and_write,
     write_openfoam_dicts,
     wgs84_to_lv95,
@@ -166,9 +168,11 @@ with st.sidebar:
         "Shift elevation to zero", value=True,
         help="Subtract minimum elevation so terrain base starts near z=0",
     )
-    x_axis_north = st.checkbox(
-        "X-axis positive towards North", value=True,
-        help="Rotate 90° CW so X points North (right-handed: Y=West, Z=Up)",
+    wind_direction = st.number_input(
+        "Wind direction (° from N)", min_value=0, max_value=359,
+        value=0, step=1,
+        help="Meteorological wind-from direction. Domain x-axis aligns downwind. "
+             "Wind enters from xMin as (U,0,0). Set 0 for no rotation (X=East).",
     )
 
 # ---------------------------------------------------------------------------
@@ -384,10 +388,16 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
         status = st.status("Processing...", expanded=True)
 
         try:
-            # Step 1: Download
+            # Step 1: Download DEM (enlarge bbox if rotation needed)
             status.write("Downloading DEM tiles from swisstopo...")
+            download_wgs84 = bbox_wgs84
+            download_lv95 = bbox_lv95
+            if wind_direction > 0:
+                download_lv95 = compute_rotated_download_bbox(bbox_lv95, wind_direction)
+                download_wgs84 = lv95_to_wgs84(download_lv95)
+                status.write(f"  Enlarged download bbox for {wind_direction}° rotation")
             dem_path = download_dem_tiles(
-                bbox_wgs84, resolution, output_dir,
+                download_wgs84, resolution, output_dir,
                 log=lambda msg: status.write(msg),
             )
 
@@ -395,14 +405,31 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
             status.write("Processing DEM...")
             t_res = target_res if target_res > 0 else None
             x, y, Z, origin_lv95 = process_dem(
-                dem_path, bbox_lv95, gaussian_sigma, t_res,
+                dem_path, download_lv95, gaussian_sigma, t_res,
                 log=lambda msg: status.write(msg),
             )
+
+            # Step 2b: Resample onto rotated grid
+            rotation_theta = 0.0
+            if wind_direction > 0:
+                status.write(f"Rotating grid to align with {wind_direction}° wind...")
+                x, y, Z, origin_lv95, rotation_theta = resample_rotated_grid(
+                    x, y, Z, origin_lv95, bbox_lv95, wind_direction,
+                    log=lambda msg: status.write(msg),
+                )
 
             # Step 3: Extend domain
             status.write("Extending domain with buffer zones...")
             x_ext, y_ext, Z_ext, z_top, z_ref = extend_domain(
                 x, y, Z, buffer_width, ref_elevation, domain_height,
+                log=lambda msg: status.write(msg),
+            )
+
+            # Step 3a: Write padded ROI shapefile
+            status.write("Writing padded ROI shapefile...")
+            write_padded_roi_shp(
+                origin_lv95, x_ext, y_ext, output_dir,
+                theta=rotation_theta,
                 log=lambda msg: status.write(msg),
             )
 
@@ -412,13 +439,6 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
                 status.write("Shifting elevation origin to zero...")
                 Z_ext, z_top, z_ref, z_shift = shift_z_origin(
                     Z_ext, z_top, z_ref,
-                    log=lambda msg: status.write(msg),
-                )
-
-            if x_axis_north:
-                status.write("Rotating coordinate system (X -> North)...")
-                x_ext, y_ext, Z_ext = rotate_axes_north(
-                    x_ext, y_ext, Z_ext,
                     log=lambda msg: status.write(msg),
                 )
 
@@ -433,11 +453,13 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
             # Step 5: OpenFOAM dicts
             status.write("Writing OpenFOAM dictionaries...")
             write_openfoam_dicts(
-                output_dir, mesh_cell_size, x_axis_north=x_axis_north,
+                output_dir, mesh_cell_size,
+                wind_direction=wind_direction if wind_direction > 0 else None,
                 log=lambda msg: status.write(msg),
             )
 
             # Save metadata
+            bearing = (wind_direction + 180) % 360 if wind_direction > 0 else 90
             metadata = {
                 "bbox_lv95": list(bbox_lv95),
                 "bbox_wgs84": list(bbox_wgs84),
@@ -454,8 +476,10 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
                 "z_range": [float(Z_ext.min()), float(Z_ext.max())],
                 "z_top": z_top,
                 "z_shift_applied": z_shift,
-                "x_axis_north": x_axis_north,
-                "coordinate_system": "X=North, Y=West, Z=Up" if x_axis_north else "X=East, Y=North, Z=Up",
+                "wind_direction": wind_direction,
+                "x_axis_bearing": bearing,
+                "rotation_angle_rad": rotation_theta,
+                "coordinate_system": f"X bearing {bearing}° from N, Y perpendicular, Z=Up",
             }
             meta_path = output_dir / "metadata.json"
             meta_path.write_text(json.dumps(metadata, indent=2))

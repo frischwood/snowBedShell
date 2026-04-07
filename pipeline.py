@@ -15,7 +15,7 @@ import rasterio
 from rasterio.merge import merge
 from rasterio.mask import mask as rio_mask
 from scipy.ndimage import gaussian_filter, uniform_filter
-from scipy.interpolate import NearestNDInterpolator
+from scipy.interpolate import NearestNDInterpolator, RegularGridInterpolator
 from pyproj import Transformer
 from shapely.geometry import box as shapely_box
 
@@ -166,6 +166,116 @@ def process_dem(dem_path, bbox_lv95, gaussian_sigma=2.0, target_resolution=None,
 
 
 # ---------------------------------------------------------------------------
+# Step 2b: Rotate grid to align x-axis with wind direction
+# ---------------------------------------------------------------------------
+
+def compute_rotated_download_bbox(bbox_lv95, wind_direction):
+    """Compute the axis-aligned LV95 bbox that encloses the rotated ROI.
+
+    When the domain is rotated, the download area must cover the enclosing
+    axis-aligned rectangle of the rotated ROI.
+
+    Returns enlarged (e_min, n_min, e_max, n_max) in LV95.
+    """
+    e_min, n_min, e_max, n_max = bbox_lv95
+    cx, cy = (e_min + e_max) / 2, (n_min + n_max) / 2
+    hw, hh = (e_max - e_min) / 2, (n_max - n_min) / 2
+
+    bearing = np.radians((wind_direction + 180) % 360)
+    theta = np.pi / 2 - bearing  # CCW from East
+
+    # rotate the 4 corners around center
+    corners_local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    rotated_e = [cx + dx * cos_t - dy * sin_t for dx, dy in corners_local]
+    rotated_n = [cy + dx * sin_t + dy * cos_t for dx, dy in corners_local]
+
+    return (min(rotated_e), min(rotated_n), max(rotated_e), max(rotated_n))
+
+
+def resample_rotated_grid(x, y, Z, origin_lv95, bbox_lv95, wind_direction,
+                          log=print):
+    """Resample DEM onto a grid rotated to align x-axis with wind direction.
+
+    The wind enters from xMin in direction (1,0,0). The domain x-axis bearing
+    is (wind_direction + 180) % 360 from North.
+
+    Args:
+        x, y, Z: processed DEM in local coords (origin at bbox SW corner)
+        origin_lv95: (e_min, n_min) of the DEM download bbox
+        bbox_lv95: (e_min, n_min, e_max, n_max) of the original ROI
+        wind_direction: degrees from North clockwise (meteo "wind from")
+
+    Returns: (x_rot, y_rot, Z_rot, rot_origin_lv95, theta)
+        x_rot, y_rot: 1D coordinate arrays for the rotated regular grid
+        Z_rot: 2D elevation array on the rotated grid
+        rot_origin_lv95: (E, N) of the rotated grid's (0,0) corner in LV95
+        theta: rotation angle in radians (CCW from East)
+    """
+    cell_size = float(x[1] - x[0])
+    e_min_roi, n_min_roi, e_max_roi, n_max_roi = bbox_lv95
+    cx = (e_min_roi + e_max_roi) / 2
+    cy = (n_min_roi + n_max_roi) / 2
+    hw = (e_max_roi - e_min_roi) / 2
+    hh = (n_max_roi - n_min_roi) / 2
+
+    bearing = np.radians((wind_direction + 180) % 360)
+    theta = np.pi / 2 - bearing  # CCW from East
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+    log(f"  Wind from {wind_direction}°, x-axis bearing {(wind_direction+180)%360}°, "
+        f"rotation θ={np.degrees(theta):.1f}° from East")
+
+    # Rotate the 4 ROI corners into the rotated frame to find grid extent
+    corners_lv95 = [
+        (cx - hw, cy - hh), (cx + hw, cy - hh),
+        (cx + hw, cy + hh), (cx - hw, cy + hh),
+    ]
+    # Transform to rotated coords (centered on cx, cy)
+    rot_x = [ (e - cx) * cos_t + (n - cy) * sin_t for e, n in corners_lv95]
+    rot_y = [-(e - cx) * sin_t + (n - cy) * cos_t for e, n in corners_lv95]
+
+    # Grid extent in rotated coords
+    rx_min, rx_max = min(rot_x), max(rot_x)
+    ry_min, ry_max = min(rot_y), max(rot_y)
+
+    # Build regular grid in rotated coordinates
+    nx_rot = int(round((rx_max - rx_min) / cell_size))
+    ny_rot = int(round((ry_max - ry_min) / cell_size))
+    x_rot = np.arange(nx_rot) * cell_size
+    y_rot = np.arange(ny_rot) * cell_size
+
+    # The (0,0) corner of the rotated grid in LV95
+    rot_origin_e = cx + rx_min * cos_t - ry_min * sin_t
+    rot_origin_n = cy + rx_min * sin_t + ry_min * cos_t
+    rot_origin_lv95 = (rot_origin_e, rot_origin_n)
+
+    # Transform all rotated grid points to LV95 for DEM sampling
+    xx, yy = np.meshgrid(x_rot, y_rot)  # (ny_rot, nx_rot)
+    # absolute rotated coords (before centering)
+    rx_abs = rx_min + xx
+    ry_abs = ry_min + yy
+    # back to LV95
+    E_grid = cx + rx_abs * cos_t - ry_abs * sin_t
+    N_grid = cy + rx_abs * sin_t + ry_abs * cos_t
+
+    # Convert LV95 grid points to DEM local coords for interpolation
+    e_local = E_grid - origin_lv95[0]
+    n_local = N_grid - origin_lv95[1]
+
+    # Interpolate DEM at rotated grid points
+    interp = RegularGridInterpolator((y, x), Z, method='linear',
+                                     bounds_error=False, fill_value=None)
+    pts = np.column_stack([n_local.ravel(), e_local.ravel()])
+    Z_rot = interp(pts).reshape(ny_rot, nx_rot)
+
+    log(f"  Rotated grid: {nx_rot}x{ny_rot}, res={cell_size}m, "
+        f"Z=[{Z_rot[np.isfinite(Z_rot)].min():.1f}, {Z_rot[np.isfinite(Z_rot)].max():.1f}]m")
+
+    return x_rot, y_rot, Z_rot, rot_origin_lv95, theta
+
+
+# ---------------------------------------------------------------------------
 # Step 3: Extend domain with smooth buffer zones
 # ---------------------------------------------------------------------------
 
@@ -253,6 +363,69 @@ def extend_domain(x, y, Z, buffer_width=200.0, ref_elevation="mean_edge",
     log(f"  Extended: {nx_ext}x{ny_ext}, z_ref={z_ref:.1f}m, ceiling={z_top:.1f}m")
 
     return x_ext, y_ext, Z_ext, z_top, z_ref
+
+
+# ---------------------------------------------------------------------------
+# Step 3a: Write padded ROI shapefile
+# ---------------------------------------------------------------------------
+
+def write_padded_roi_shp(origin_lv95, x_ext, y_ext, output_dir,
+                         theta=0.0, log=print):
+    """Write a shapefile of the padded domain extent in EPSG:2056 (LV95).
+
+    If theta != 0, the domain is a rotated rectangle. The 4 corners in local
+    rotated coords are transformed back to LV95.
+
+    Args:
+        origin_lv95: (E, N) of the grid's (0,0) corner in LV95
+        x_ext, y_ext: extended local coordinate arrays
+        output_dir: output directory
+        theta: rotation angle in radians (CCW from East), 0 = axis-aligned
+    """
+    import shapefile
+
+    x0, x1 = float(x_ext[0]), float(x_ext[-1])
+    y0, y1 = float(y_ext[0]), float(y_ext[-1])
+    oe, on = origin_lv95
+
+    # 4 corners in local coords → LV95
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+    corners_local = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+    corners_lv95 = [
+        (oe + lx * cos_t - ly * sin_t, on + lx * sin_t + ly * cos_t)
+        for lx, ly in corners_local
+    ]
+    corners_lv95.append(corners_lv95[0])  # close the ring
+
+    out_path = Path(output_dir) / "ROI_padded"
+    w = shapefile.Writer(str(out_path))
+    w.shapeType = shapefile.POLYGON
+    w.field("name", "C", size=40)
+    w.poly([[[e, n] for e, n in corners_lv95]])
+    w.record("padded_domain")
+    w.close()
+
+    # Write .prj for EPSG:2056
+    prj_wkt = (
+        'PROJCS["CH1903+_LV95",'
+        'GEOGCS["GCS_CH1903+",'
+        'DATUM["D_CH1903+",'
+        'SPHEROID["Bessel_1841",6377397.155,299.1528128]],'
+        'PRIMEM["Greenwich",0.0],'
+        'UNIT["Degree",0.0174532925199433]],'
+        'PROJECTION["Hotine_Oblique_Mercator_Azimuth_Center"],'
+        'PARAMETER["False_Easting",2600000.0],'
+        'PARAMETER["False_Northing",1200000.0],'
+        'PARAMETER["Scale_Factor",1.0],'
+        'PARAMETER["Azimuth",90.0],'
+        'PARAMETER["Longitude_Of_Center",7.439583333333333],'
+        'PARAMETER["Latitude_Of_Center",46.95240555555556],'
+        'UNIT["Meter",1.0]]'
+    )
+    (Path(output_dir) / "ROI_padded.prj").write_text(prj_wkt)
+
+    log(f"  Padded ROI: E[{e_min:.1f}, {e_max:.1f}] N[{n_min:.1f}, {n_max:.1f}]")
+    return (e_min, n_min, e_max, n_max)
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +686,7 @@ def _write_stl(path, vertices, triangles):
 # Step 5: Template OpenFOAM dicts
 # ---------------------------------------------------------------------------
 
-def write_openfoam_dicts(output_dir, mesh_cell_size=8, x_axis_north=False, log=print):
+def write_openfoam_dicts(output_dir, mesh_cell_size=8, wind_direction=None, log=print):
     """Write meshDict and createPatchDict templates."""
     output_dir = Path(output_dir)
     system_dir = output_dir / "system"
@@ -574,11 +747,12 @@ renameBoundary
     log(f"  Written: meshDict")
 
     cpd_path = system_dir / "createPatchDict"
-    if x_axis_north:
+    if wind_direction is not None and wind_direction > 0:
+        bearing = (wind_direction + 180) % 360
         coord_comment = (
-            "// Coordinate system: X = North, Y = -East (West), Z = Up\n"
-            "// inlet (xMin) = South, outlet (xMax) = North\n"
-            "// front (yMin) = East, back (yMax) = West\n\n"
+            f"// Wind from {wind_direction}° (meteo), x-axis bearing {bearing}°\n"
+            f"// inlet (xMin) = upwind, outlet (xMax) = downwind\n"
+            f"// Wind velocity: U = (Umag, 0, 0)\n\n"
         )
     else:
         coord_comment = (
