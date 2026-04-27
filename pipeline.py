@@ -181,8 +181,7 @@ def compute_rotated_download_bbox(bbox_lv95, wind_direction):
     cx, cy = (e_min + e_max) / 2, (n_min + n_max) / 2
     hw, hh = (e_max - e_min) / 2, (n_max - n_min) / 2
 
-    bearing = np.radians((wind_direction + 180) % 360)
-    theta = np.pi / 2 - bearing  # CCW from East
+    theta = -np.radians(wind_direction)  # CW rotation by wind_direction
 
     # rotate the 4 corners around center
     corners_local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
@@ -195,10 +194,10 @@ def compute_rotated_download_bbox(bbox_lv95, wind_direction):
 
 def resample_rotated_grid(x, y, Z, origin_lv95, bbox_lv95, wind_direction,
                           log=print):
-    """Resample DEM onto a grid rotated to align x-axis with wind direction.
+    """Resample DEM onto a grid rotated so the north-edge normal faces the wind.
 
-    The wind enters from xMin in direction (1,0,0). The domain x-axis bearing
-    is (wind_direction + 180) % 360 from North.
+    The rectangle is rotated CW by wind_direction degrees. After rotation the
+    original north edge's outward normal points at bearing = wind_direction.
 
     Args:
         x, y, Z: processed DEM in local coords (origin at bbox SW corner)
@@ -210,7 +209,7 @@ def resample_rotated_grid(x, y, Z, origin_lv95, bbox_lv95, wind_direction,
         x_rot, y_rot: 1D coordinate arrays for the rotated regular grid
         Z_rot: 2D elevation array on the rotated grid
         rot_origin_lv95: (E, N) of the rotated grid's (0,0) corner in LV95
-        theta: rotation angle in radians (CCW from East)
+        theta: rotation angle in radians (CW = negative)
     """
     cell_size = float(x[1] - x[0])
     e_min_roi, n_min_roi, e_max_roi, n_max_roi = bbox_lv95
@@ -219,12 +218,10 @@ def resample_rotated_grid(x, y, Z, origin_lv95, bbox_lv95, wind_direction,
     hw = (e_max_roi - e_min_roi) / 2
     hh = (n_max_roi - n_min_roi) / 2
 
-    bearing = np.radians((wind_direction + 180) % 360)
-    theta = np.pi / 2 - bearing  # CCW from East
+    theta = -np.radians(wind_direction)  # CW rotation by wind_direction
     cos_t, sin_t = np.cos(theta), np.sin(theta)
 
-    log(f"  Wind from {wind_direction}°, x-axis bearing {(wind_direction+180)%360}°, "
-        f"rotation θ={np.degrees(theta):.1f}° from East")
+    log(f"  Wind from {wind_direction}°, rotation {wind_direction}° CW")
 
     # Rotate the 4 ROI corners into the rotated frame to find grid extent
     corners_lv95 = [
@@ -265,12 +262,31 @@ def resample_rotated_grid(x, y, Z, origin_lv95, bbox_lv95, wind_direction,
 
     # Interpolate DEM at rotated grid points
     interp = RegularGridInterpolator((y, x), Z, method='linear',
-                                     bounds_error=False, fill_value=None)
+                                     bounds_error=False, fill_value=np.nan)
     pts = np.column_stack([n_local.ravel(), e_local.ravel()])
     Z_rot = interp(pts).reshape(ny_rot, nx_rot)
 
+    finite_mask = np.isfinite(Z_rot)
+    if not finite_mask.any():
+        raise ValueError(
+            "Rotated grid is fully outside DEM coverage. "
+            "Increase the ROI margin or check the wind_direction value."
+        )
+
+    n_nan = int((~finite_mask).sum())
+    if n_nan:
+        # Fill NaN cells with nearest finite value so triangulation stays valid.
+        rows_ok, cols_ok = np.where(finite_mask)
+        nn = NearestNDInterpolator(
+            np.column_stack([rows_ok, cols_ok]), Z_rot[finite_mask]
+        )
+        rows_bad, cols_bad = np.where(~finite_mask)
+        Z_rot[~finite_mask] = nn(np.column_stack([rows_bad, cols_bad]))
+        frac = n_nan / Z_rot.size
+        log(f"  Filled {n_nan} NaN cells ({frac:.1%}) via nearest-finite extrapolation")
+
     log(f"  Rotated grid: {nx_rot}x{ny_rot}, res={cell_size}m, "
-        f"Z=[{Z_rot[np.isfinite(Z_rot)].min():.1f}, {Z_rot[np.isfinite(Z_rot)].max():.1f}]m")
+        f"Z=[{Z_rot.min():.1f}, {Z_rot.max():.1f}]m")
 
     return x_rot, y_rot, Z_rot, rot_origin_lv95, theta
 
@@ -380,7 +396,8 @@ def write_padded_roi_shp(origin_lv95, x_ext, y_ext, output_dir,
         origin_lv95: (E, N) of the grid's (0,0) corner in LV95
         x_ext, y_ext: extended local coordinate arrays
         output_dir: output directory
-        theta: rotation angle in radians (CCW from East), 0 = axis-aligned
+        theta: rotation angle in radians; negative = CW (matches the value
+            returned by resample_rotated_grid), 0 = axis-aligned
     """
     import shapefile
 
@@ -424,6 +441,10 @@ def write_padded_roi_shp(origin_lv95, x_ext, y_ext, output_dir,
     )
     (Path(output_dir) / "ROI_padded.prj").write_text(prj_wkt)
 
+    es = [c[0] for c in corners_lv95[:-1]]
+    ns = [c[1] for c in corners_lv95[:-1]]
+    e_min, e_max = min(es), max(es)
+    n_min, n_max = min(ns), max(ns)
     log(f"  Padded ROI: E[{e_min:.1f}, {e_max:.1f}] N[{n_min:.1f}, {n_max:.1f}]")
     return (e_min, n_min, e_max, n_max)
 
@@ -443,22 +464,6 @@ def shift_z_origin(Z_ext, z_top, z_ref, log=print):
     z_ref = z_ref - z_min
     log(f"  Z-shift: subtracted {z_min:.1f}m (new range [{Z_ext.min():.1f}, {Z_ext.max():.1f}])")
     return Z_ext, z_top, z_ref, z_min
-
-
-def rotate_axes_north(x_ext, y_ext, Z_ext, log=print):
-    """Rotate coordinate system 90 deg CW so x-axis points North.
-
-    Mapping: new_x = old_y, new_y = -old_x (right-handed: x=North, y=West, z=Up).
-    Z array is rotated with np.rot90(Z, k=1).
-
-    Returns (x_new, y_new, Z_new).
-    """
-    x_new = y_ext.copy()
-    y_new = -x_ext[::-1].copy()
-    Z_new = np.rot90(Z_ext, k=1)
-    log(f"  Rotated: x-axis now points North (x=[{x_new[0]:.1f}, {x_new[-1]:.1f}], "
-        f"y=[{y_new[0]:.1f}, {y_new[-1]:.1f}])")
-    return x_new, y_new, Z_new
 
 
 # ---------------------------------------------------------------------------
@@ -865,7 +870,8 @@ def read_shp_bbox(shp_file, shx_file=None, dbf_file=None, prj_file=None):
     shx_file, dbf_file : file-like, optional
         Companion files (pyshp may need them).
     prj_file : file-like or str, optional
-        The .prj file for CRS detection. If absent, LV95 (EPSG:2056) is assumed.
+        The .prj file for CRS detection. If absent or unparseable,
+        LV95 (EPSG:2056) is assumed and prj_used is False.
 
     Returns
     -------
@@ -873,6 +879,8 @@ def read_shp_bbox(shp_file, shx_file=None, dbf_file=None, prj_file=None):
         (e_min, n_min, e_max, n_max) in EPSG:2056.
     source_crs : str
         Detected or assumed CRS identifier.
+    prj_used : bool
+        True if a .prj file was provided AND parsed successfully.
     """
     import shapefile
 
@@ -887,6 +895,7 @@ def read_shp_bbox(shp_file, shx_file=None, dbf_file=None, prj_file=None):
 
     # Detect CRS from .prj
     source_crs = "EPSG:2056"
+    prj_used = False
     if prj_file is not None:
         prj_text = prj_file if isinstance(prj_file, str) else prj_file.read()
         if isinstance(prj_text, bytes):
@@ -896,6 +905,7 @@ def read_shp_bbox(shp_file, shx_file=None, dbf_file=None, prj_file=None):
             detected = CRS.from_wkt(prj_text)
             epsg = detected.to_epsg()
             source_crs = f"EPSG:{epsg}" if epsg else detected.to_string()
+            prj_used = True
         except Exception:
             pass
 
@@ -908,6 +918,6 @@ def read_shp_bbox(shp_file, shx_file=None, dbf_file=None, prj_file=None):
             e_min, e_max = e_max, e_min
         if n_min > n_max:
             n_min, n_max = n_max, n_min
-        return (e_min, n_min, e_max, n_max), source_crs
+        return (e_min, n_min, e_max, n_max), source_crs, prj_used
 
-    return (x_min, y_min, x_max, y_max), source_crs
+    return (x_min, y_min, x_max, y_max), source_crs, prj_used

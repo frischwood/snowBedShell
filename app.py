@@ -19,6 +19,7 @@ import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 
+from pyproj import Transformer
 from shapely.geometry import Polygon, box as shapely_box
 
 from pipeline import (
@@ -116,6 +117,12 @@ if "bbox_wgs84" not in st.session_state:
     st.session_state.bbox_wgs84 = None
     st.session_state.bbox_lv95 = None
     st.session_state.roi_error = None
+    # Bumped whenever the bbox is set externally (draw, manual entry, shapefile,
+    # click-to-move, reset). Used as a key suffix on the dimension sliders so they
+    # re-initialize to the new bbox; left untouched when the sliders themselves
+    # change the bbox so the in-flight drag isn't clobbered.
+    st.session_state.bbox_version = 0
+    st.session_state.last_processed_click = None
 if "result_zip" not in st.session_state:
     st.session_state.result_zip = None
     st.session_state.result_plot = None
@@ -168,12 +175,59 @@ with st.sidebar:
         "Shift elevation to zero", value=True,
         help="Subtract minimum elevation so terrain base starts near z=0",
     )
-    wind_direction = st.number_input(
-        "Wind direction (° from N)", min_value=0, max_value=359,
+    wind_direction = st.slider(
+        "Wind direction (° from N)", min_value=0, max_value=360,
         value=0, step=1,
-        help="Meteorological wind-from direction. Domain x-axis aligns downwind. "
-             "Wind enters from xMin as (U,0,0). Set 0 for no rotation (X=East).",
+        help="Meteorological wind-from direction. North edge normal points in this direction. "
+             "Set 0 for no rotation (X=East). The ROI rectangle on the map rotates as you drag.",
     )
+
+    st.divider()
+    st.header("Region of Interest")
+    _has_sel = st.session_state.bbox_lv95 is not None
+    if _has_sel:
+        _e_min, _n_min, _e_max, _n_max = st.session_state.bbox_lv95
+        _init_len = max(100, min(10000, int(round(_e_max - _e_min))))
+        _init_wid = max(100, min(10000, int(round(_n_max - _n_min))))
+    else:
+        _init_len, _init_wid = 2000, 2000
+    _v = st.session_state.get("bbox_version", 0)
+    length_m = st.slider(
+        "E–W extent [m]", 100, 10000, _init_len, step=10,
+        disabled=not _has_sel,
+        key=f"roi_length_{_v}",
+        help="Rectangle size along the East–West axis (before rotation).",
+    )
+    width_m = st.slider(
+        "N–S extent [m]", 100, 10000, _init_wid, step=10,
+        disabled=not _has_sel,
+        key=f"roi_width_{_v}",
+        help="Rectangle size along the North–South axis (before rotation).",
+    )
+    shift_mode = st.checkbox(
+        "Move ROI by clicking on map",
+        value=False,
+        disabled=not _has_sel,
+        help="When ON, clicking on the map shifts the rectangle's center to that point. "
+             "Dimensions are preserved.",
+    )
+    if _has_sel and (length_m != _init_len or width_m != _init_wid):
+        _cx = (_e_min + _e_max) / 2
+        _cy = (_n_min + _n_max) / 2
+        _new_bbox = (
+            _cx - length_m / 2, _cy - width_m / 2,
+            _cx + length_m / 2, _cy + width_m / 2,
+        )
+        _ok, _msg = validate_roi(_new_bbox)
+        if _ok:
+            st.session_state.bbox_lv95 = _new_bbox
+            st.session_state.bbox_wgs84 = lv95_to_wgs84(_new_bbox)
+            st.session_state.roi_error = None
+            st.session_state.result_zip = None
+            st.session_state.result_plot = None
+            st.session_state.result_meta = None
+        else:
+            st.session_state.roi_error = _msg
 
 # ---------------------------------------------------------------------------
 # Map selection
@@ -191,55 +245,120 @@ with col_map:
         attr="swisstopo",
     )
 
-    # Show previously selected region
-    if st.session_state.bbox_wgs84:
-        lon_min, lat_min, lon_max, lat_max = st.session_state.bbox_wgs84
-        folium.Rectangle(
-            bounds=[[lat_min, lon_min], [lat_max, lon_max]],
-            color="#2196F3", weight=2, fill=True, fill_opacity=0.1,
-            tooltip="Current selection",
-        ).add_to(m)
-        # Center map on selection
-        m.fit_bounds([[lat_min, lon_min], [lat_max, lon_max]], padding=[50, 50])
+    _t_to_wgs = Transformer.from_crs("EPSG:2056", "EPSG:4326", always_xy=True)
+    _t_to_lv = Transformer.from_crs("EPSG:4326", "EPSG:2056", always_xy=True)
 
+    has_selection = st.session_state.bbox_lv95 is not None
+
+    if has_selection:
+        e_min_r, n_min_r, e_max_r, n_max_r = st.session_state.bbox_lv95
+        cx = (e_min_r + e_max_r) / 2
+        cy = (n_min_r + n_max_r) / 2
+        hw = (e_max_r - e_min_r) / 2
+        hh = (n_max_r - n_min_r) / 2
+        # CW rotation by wind_direction so the original north edge of the ROI
+        # ends up facing the wind (meteorological "wind from" convention).
+        theta = -np.radians(wind_direction % 360)
+        cos_t, sin_t = np.cos(theta), np.sin(theta)
+        corners_local = [(-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh)]
+        corners_lv95 = [
+            (cx + dx * cos_t - dy * sin_t, cy + dx * sin_t + dy * cos_t)
+            for dx, dy in corners_local
+        ]
+        corners_wgs = [_t_to_wgs.transform(e, n) for e, n in corners_lv95]
+        corners_latlon = [[lat, lon] for lon, lat in corners_wgs]
+
+        # Render the rotated rectangle as a server-side folium element. The map
+        # HTML is rebuilt every Streamlit rerun, so dragging the wind-direction
+        # slider produces an instant visual update with no JS race conditions.
+        folium.Polygon(
+            locations=corners_latlon,
+            color="#e74c3c", weight=2, fill=True, fill_opacity=0.15,
+            tooltip=(f"ROI ({wind_direction}° rotation)"
+                     if wind_direction % 360 > 0 else "ROI"),
+        ).add_to(m)
+
+        lats_fit = [c[0] for c in corners_latlon]
+        lons_fit = [c[1] for c in corners_latlon]
+        m.fit_bounds(
+            [[min(lats_fit), min(lons_fit)], [max(lats_fit), max(lons_fit)]],
+            padding=[50, 50],
+        )
+
+    # Draw plugin: allow rectangle drawing only when no selection exists.
+    # Edit/remove is disabled — clearing happens via the "Reset selection" button.
     Draw(
         draw_options={
             "polyline": False, "polygon": False, "circle": False,
             "circlemarker": False, "marker": False,
-            "rectangle": {
+            "rectangle": False if has_selection else {
                 "shapeOptions": {"color": "#e74c3c", "weight": 2, "fillOpacity": 0.15}
             },
         },
-        edit_options={"remove": True},
+        edit_options={"edit": False, "remove": False},
     ).add_to(m)
 
-    map_output = st_folium(m, width=None, height=500, returned_objects=["all_drawings"])
+    map_output = st_folium(
+        m, width=None, height=500,
+        returned_objects=["all_drawings", "last_clicked"],
+    )
 
-# Parse new drawings from map
-if map_output and map_output.get("all_drawings"):
+# Parse new drawing from map. Only when no selection exists — once a rectangle
+# is saved, the Draw plugin is disabled and the displayed polygon is rendered
+# server-side (not in drawnItems), so all_drawings is empty for re-renders.
+if not has_selection and map_output and map_output.get("all_drawings"):
     drawings = map_output["all_drawings"]
     if drawings:
         last = drawings[-1]
         coords = last["geometry"]["coordinates"][0]
         lons = [c[0] for c in coords]
         lats = [c[1] for c in coords]
-        new_wgs84 = (min(lons), min(lats), max(lons), max(lats))
-        # Only update if actually changed
-        if new_wgs84 != st.session_state.bbox_wgs84:
-            new_lv95 = wgs84_to_lv95(new_wgs84)
-            ok, msg = validate_roi(new_lv95)
-            if ok:
-                st.session_state.bbox_wgs84 = new_wgs84
-                st.session_state.bbox_lv95 = new_lv95
-                st.session_state.roi_error = None
-                # Clear old results when region changes
-                st.session_state.result_zip = None
-                st.session_state.result_plot = None
-                st.session_state.result_meta = None
-            else:
-                st.session_state.bbox_wgs84 = None
-                st.session_state.bbox_lv95 = None
-                st.session_state.roi_error = msg
+        verts_lv = [_t_to_lv.transform(lon, lat) for lon, lat in zip(lons, lats)]
+        new_lv95 = (
+            min(e for e, _ in verts_lv), min(n for _, n in verts_lv),
+            max(e for e, _ in verts_lv), max(n for _, n in verts_lv),
+        )
+        ok, msg = validate_roi(new_lv95)
+        if ok:
+            st.session_state.bbox_wgs84 = lv95_to_wgs84(new_lv95)
+            st.session_state.bbox_lv95 = new_lv95
+            st.session_state.bbox_version += 1
+            st.session_state.roi_error = None
+            st.session_state.result_zip = None
+            st.session_state.result_plot = None
+            st.session_state.result_meta = None
+            st.rerun()
+        else:
+            st.session_state.roi_error = msg
+
+# Click-to-shift: when shift_mode is ON, treat a fresh map click as the new
+# rectangle center. Dimensions are preserved.
+if (shift_mode and has_selection and map_output
+        and map_output.get("last_clicked")):
+    _click = map_output["last_clicked"]
+    _click_id = (round(_click["lat"], 6), round(_click["lng"], 6))
+    if st.session_state.last_processed_click != _click_id:
+        st.session_state.last_processed_click = _click_id
+        _new_e, _new_n = _t_to_lv.transform(_click["lng"], _click["lat"])
+        _e_min, _n_min, _e_max, _n_max = st.session_state.bbox_lv95
+        _length = _e_max - _e_min
+        _width = _n_max - _n_min
+        _shifted = (
+            _new_e - _length / 2, _new_n - _width / 2,
+            _new_e + _length / 2, _new_n + _width / 2,
+        )
+        _ok, _msg = validate_roi(_shifted)
+        if _ok:
+            st.session_state.bbox_lv95 = _shifted
+            st.session_state.bbox_wgs84 = lv95_to_wgs84(_shifted)
+            st.session_state.bbox_version += 1
+            st.session_state.roi_error = None
+            st.session_state.result_zip = None
+            st.session_state.result_plot = None
+            st.session_state.result_meta = None
+            st.rerun()
+        else:
+            st.session_state.roi_error = _msg
 
 with col_info:
     if st.session_state.bbox_lv95:
@@ -267,6 +386,7 @@ with col_info:
         if st.button("Reset selection"):
             st.session_state.bbox_wgs84 = None
             st.session_state.bbox_lv95 = None
+            st.session_state.bbox_version += 1
             st.session_state.roi_error = None
             st.session_state.result_zip = None
             st.session_state.result_plot = None
@@ -292,10 +412,13 @@ with st.expander("Or enter LV95 coordinates manually"):
                 if ok:
                     st.session_state.bbox_lv95 = manual_lv95
                     st.session_state.bbox_wgs84 = lv95_to_wgs84(manual_lv95)
+                    st.session_state.bbox_version += 1
                     st.session_state.roi_error = None
                     st.session_state.result_zip = None
                     st.session_state.result_plot = None
+                    st.session_state.result_meta = None
                     st.success(f"Set: {manual_lv95}")
+                    st.rerun()
                 else:
                     st.error(msg)
             else:
@@ -341,10 +464,17 @@ with st.expander("Or upload a shapefile (.shp)"):
             st.error("No .shp file found.")
         else:
             try:
-                bbox_from_shp, detected_crs = read_shp_bbox(
+                bbox_from_shp, detected_crs, prj_used = read_shp_bbox(
                     shp_file, shx_file=shx_file, dbf_file=dbf_file, prj_file=prj_file,
                 )
-                st.info(f"Detected CRS: {detected_crs}")
+                if prj_used:
+                    st.info(f"Detected CRS: {detected_crs}")
+                else:
+                    st.warning(
+                        f"No .prj sidecar found (or it was unparseable); "
+                        f"assuming {detected_crs}. If your shapefile uses a "
+                        f"different CRS, the bounding box will be wrong."
+                    )
                 st.caption(
                     f"Bounding box (LV95): E [{bbox_from_shp[0]:.0f}, {bbox_from_shp[2]:.0f}], "
                     f"N [{bbox_from_shp[1]:.0f}, {bbox_from_shp[3]:.0f}]"
@@ -355,6 +485,7 @@ with st.expander("Or upload a shapefile (.shp)"):
                     if st.button("Use this bounding box", key="use_shp_bbox"):
                         st.session_state.bbox_lv95 = bbox_from_shp
                         st.session_state.bbox_wgs84 = lv95_to_wgs84(bbox_from_shp)
+                        st.session_state.bbox_version += 1
                         st.session_state.roi_error = None
                         st.session_state.result_zip = None
                         st.session_state.result_plot = None
@@ -392,8 +523,17 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
             status.write("Downloading DEM tiles from swisstopo...")
             download_wgs84 = bbox_wgs84
             download_lv95 = bbox_lv95
-            if wind_direction > 0:
+            if wind_direction % 360 > 0:
                 download_lv95 = compute_rotated_download_bbox(bbox_lv95, wind_direction)
+                # The rotated AABB can be up to sqrt(2)x larger than the user's ROI.
+                # If it spills outside Switzerland, swisstopo has no tiles there —
+                # raise a clear error before the long DEM download.
+                if not _SWISS_BOUNDARY_LV95.contains(shapely_box(*download_lv95)):
+                    raise ValueError(
+                        f"The enlarged download bbox for a {wind_direction}° rotation "
+                        f"extends outside Switzerland. Move your ROI further from the "
+                        f"border or reduce the rotation angle."
+                    )
                 download_wgs84 = lv95_to_wgs84(download_lv95)
                 status.write(f"  Enlarged download bbox for {wind_direction}° rotation")
             dem_path = download_dem_tiles(
@@ -411,7 +551,7 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
 
             # Step 2b: Resample onto rotated grid
             rotation_theta = 0.0
-            if wind_direction > 0:
+            if wind_direction % 360 > 0:
                 status.write(f"Rotating grid to align with {wind_direction}° wind...")
                 x, y, Z, origin_lv95, rotation_theta = resample_rotated_grid(
                     x, y, Z, origin_lv95, bbox_lv95, wind_direction,
@@ -454,12 +594,16 @@ if st.button("Run Pipeline", type="primary", disabled=run_disabled, use_containe
             status.write("Writing OpenFOAM dictionaries...")
             write_openfoam_dicts(
                 output_dir, mesh_cell_size,
-                wind_direction=wind_direction if wind_direction > 0 else None,
+                wind_direction=wind_direction if wind_direction % 360 > 0 else None,
                 log=lambda msg: status.write(msg),
             )
 
             # Save metadata
-            bearing = (wind_direction + 180) % 360 if wind_direction > 0 else 90
+            # Bearing of the new x-axis from North.
+            # wind_direction = 0 → no rotation, x-axis points East (bearing 90°).
+            # wind_direction > 0 → rectangle is rotated CW so its original north edge
+            # faces the wind; the rotated x-axis bearing is (wind_direction + 180) % 360.
+            bearing = (wind_direction + 180) % 360 if wind_direction % 360 > 0 else 90
             metadata = {
                 "bbox_lv95": list(bbox_lv95),
                 "bbox_wgs84": list(bbox_wgs84),
@@ -563,17 +707,17 @@ if st.session_state.result_zip:
         use_container_width=True,
     )
 
-    with st.expander("ZIP contents"):
-        st.code(
-            "cfmesh_output/\n"
-            "  constant/triSurface/bbox.fms\n"
-            "  constant/triSurface/bbox.stl  (if enabled)\n"
-            "  system/meshDict\n"
-            "  system/createPatchDict\n"
-            "  metadata.json\n"
-            "  terrain_preview.png",
-            language=None,
+    with zipfile.ZipFile(io.BytesIO(st.session_state.result_zip)) as _zf:
+        _entries = sorted(
+            (info.filename, info.file_size) for info in _zf.infolist()
         )
+    with st.expander(f"ZIP contents ({len(_entries)} files)"):
+        _name_w = max((len(n) for n, _ in _entries), default=0)
+        _size_w = max((len(f"{s:,}") for _, s in _entries), default=1)
+        _lines = ["cfmesh_output/"]
+        for _name, _size in _entries:
+            _lines.append(f"  {_name:<{_name_w}}  {_size:>{_size_w},} B")
+        st.code("\n".join(_lines), language=None)
         st.caption(
             "Extract into your OpenFOAM case directory, then run:\n"
             "`cartesianMesh && createPatch -overwrite && checkMesh`"
